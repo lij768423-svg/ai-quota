@@ -1,0 +1,879 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>AI 额度</title>
+<link rel="icon" href="data:,">
+<style>
+/* 设计判读：给一个 Mac 用户自己看的额度工具页，苹果式的简洁高级，原生 CSS + 系统字体 + 健身圆环式仪表。
+ * 刻度（taste-skill）：变化 5，动效 4，密度 5。工具页不做营销式 hero、玻璃导航和滚动动画。
+ * 布局：一屏放完。大标题和一句结论在上，服务卡片按圆环数量分宽度排满两行，token 表跟在 Antigravity 旁边，底栏放图例和说明。
+ * 窗口矮到放不下时整页等比缩小（最多到 80%），手机宽度放不下就正常滚动。
+ * 颜色：一个强调色（苹果蓝）。状态色只表示快用完，永远配图标和文字。深浅两套都验过对比度。
+ * 形状：卡片 20px，提示条 14px，代码片 6px，按钮和套餐标签是胶囊形。 */
+:root {
+  --bg: #f5f5f7;
+  --card: #fdfdfd;
+  --ink: #1d1d1f;
+  --ink-2: #636366;
+  --ink-3: #8e8e93;
+  --separator: #e5e5ea;
+  --fill: #ececf0;
+  --fill-hover: #e2e2e7;
+  --accent: #0071e3;
+  --accent-text: #0066cc;
+  --accent-track: #dbe8fa;
+  --warning: #ff9500;
+  --warning-track: #fdead0;
+  --critical: #ff3b30;
+  --critical-track: #fddad9;
+  --idle-track: #e8e8ed;
+  --shadow: 0 1px 2px rgb(29 29 31 / 0.04), 0 6px 20px rgb(29 29 31 / 0.04);
+
+  --font-text: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --font-rounded: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont, "PingFang SC", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  --text-caption: 0.75rem;
+  --text-footnote: 0.8125rem;
+  --text-body: 0.9375rem;
+  --text-headline: 1.0625rem;
+  --text-large: 1.75rem;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+
+  --radius-card: 1.25rem;
+  --radius-note: 0.875rem;
+  --gap: 0.75rem;
+  --pad-x: 1.25rem;
+  --pad-y: 1rem;
+  --gauge-width: 8rem;
+  --ring-size: 5.5rem;
+
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a0a0b;
+    --card: #1c1c1e;
+    --ink: #f5f5f7;
+    --ink-2: #98989d;
+    --ink-3: #8e8e93;
+    --separator: #38383a;
+    --fill: #2c2c2e;
+    --fill-hover: #3a3a3c;
+    --accent: #0a84ff;
+    --accent-text: #2997ff;
+    --accent-track: #18334f;
+    --warning: #ff9f0a;
+    --warning-track: #4e391a;
+    --critical: #ff453a;
+    --critical-track: #4e2524;
+    --idle-track: #2c2c2e;
+    --shadow: none;
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { overflow-x: clip; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: var(--text-body);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, p { margin: 0; }
+
+.page {
+  max-width: 80rem;
+  margin: 0 auto;
+  padding-block: var(--space-4) var(--space-3);
+  padding-left: max(1.25rem, env(safe-area-inset-left, 0px));
+  padding-right: max(1.25rem, env(safe-area-inset-right, 0px));
+}
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+.top h1 {
+  font-family: var(--font-display);
+  font-size: var(--text-large);
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--ink-2);
+  font-size: var(--text-footnote);
+  font-variant-numeric: tabular-nums;
+}
+button {
+  min-height: 2rem;
+  padding: 0 var(--space-4);
+  border: 0;
+  border-radius: 999px;
+  background: var(--fill);
+  color: var(--accent-text);
+  font: inherit;
+  font-size: var(--text-footnote);
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 150ms var(--ease-out), transform 150ms var(--ease-out);
+}
+button:hover:not(:disabled) { background: var(--fill-hover); }
+button:active:not(:disabled) { transform: scale(0.97); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { color: var(--ink-2); cursor: progress; }
+
+.banner {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-note);
+  background: var(--critical-track);
+  font-size: var(--text-footnote);
+}
+.banner[hidden] { display: none; }
+code {
+  padding: 0.0625rem var(--space-1);
+  border-radius: 6px;
+  background: var(--fill);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.content {
+  display: grid;
+  gap: var(--gap);
+  margin-top: var(--space-1);
+  transition: opacity 150ms var(--ease-out);
+}
+main[aria-busy="true"] .content { opacity: 0.6; }
+
+.summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-3);
+}
+.summary-main {
+  font-family: var(--font-display);
+  font-size: var(--text-headline);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.summary-sub { color: var(--ink-2); font-size: var(--text-footnote); font-variant-numeric: tabular-nums; }
+.keep { white-space: nowrap; }
+
+/* 卡片宽度按圆环数和分组数算，flex-grow 把每一行剩下的空间按比例分掉，行尾不留空洞。 */
+.board {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap);
+}
+.card {
+  min-width: 0;
+  padding: var(--pad-y) var(--pad-x);
+  border-radius: var(--radius-card);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+.service {
+  --span: 1;
+  --groups: 1;
+  flex: var(--span) 1 calc(
+    var(--span) * (var(--gauge-width) + var(--space-3)) + (var(--groups) - 1) * var(--space-5) + 2 * var(--pad-x)
+  );
+}
+/* 卡片头部固定两行：服务名一行，套餐和记录时间一行。高度一致，同一行卡片的圆环才对得齐。 */
+.card-head { display: grid; gap: 0.125rem; margin-bottom: var(--space-3); }
+.service-name {
+  overflow: hidden;
+  font-family: var(--font-display);
+  font-size: var(--text-headline);
+  font-weight: 600;
+  line-height: 1.3;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.service-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 1.25rem;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.plan {
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  background: var(--fill);
+  color: var(--ink-2);
+  font-size: var(--text-caption);
+  font-weight: 600;
+  line-height: 1.25rem;
+  white-space: nowrap;
+}
+.plan { flex: none; }
+.service-seen { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.service-seen, .service-note, .foot, .caption {
+  color: var(--ink-2);
+  font-size: var(--text-footnote);
+}
+.service-note { max-width: 18rem; text-wrap: pretty; }
+
+.groups {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: var(--space-4) var(--space-5);
+}
+.groups.single .group { flex: 1; }
+.groups.single .gauges { justify-content: space-around; }
+.group-name {
+  margin-bottom: var(--space-2);
+  color: var(--ink-2);
+  font-size: var(--text-footnote);
+  font-weight: 600;
+  text-align: center;
+}
+.gauges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4) var(--space-3);
+}
+.gauge {
+  width: var(--gauge-width);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.gauge-name { margin-top: var(--space-2); font-weight: 600; }
+.gauge-reset, .gauge-flags { color: var(--ink-2); font-size: var(--text-footnote); }
+.gauge-reset { white-space: nowrap; }
+.gauge-flags { margin-top: 0.125rem; text-wrap: balance; }
+.flag-icon { margin-right: var(--space-1); font-style: normal; }
+.flag-icon.warning { color: var(--warning); }
+.flag-icon.critical { color: var(--critical); }
+
+/* 圆环：粗环是用量，从 12 点顺时针走；外圈细弧是窗口已过去的时间。本地模型画一个无限符号。 */
+.ring {
+  position: relative;
+  width: var(--ring-size);
+  height: var(--ring-size);
+  margin: 0 auto;
+}
+.ring svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.ring-track { stroke: var(--accent-track); }
+.ring.warning .ring-track { stroke: var(--warning-track); }
+.ring.critical .ring-track { stroke: var(--critical-track); }
+.ring.idle .ring-track { stroke: var(--idle-track); }
+.ring-fill { stroke: var(--accent); }
+.ring.warning .ring-fill { stroke: var(--warning); }
+.ring.critical .ring-fill { stroke: var(--critical); }
+.ring-time { stroke: var(--ink-3); }
+.ring-infinity { stroke: var(--accent); }
+.ring-value {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-rounded);
+  font-variant-numeric: tabular-nums;
+}
+.ring-number { font-size: 1.5rem; font-weight: 600; letter-spacing: -0.02em; }
+.ring-unit { margin-left: 0.0625rem; color: var(--ink-2); font-size: var(--text-caption); font-weight: 600; }
+.ring.idle .ring-value { color: var(--ink-2); font-family: var(--font-text); font-size: var(--text-footnote); }
+
+.tokens { flex: 1 1 17rem; }
+.tokens h2 {
+  font-family: var(--font-display);
+  font-size: var(--text-headline);
+  font-weight: 600;
+}
+.caption { margin-top: 0.125rem; text-wrap: pretty; }
+.table-wrap { margin-top: var(--space-3); overflow-x: auto; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+th, td { padding: var(--space-2) 0; text-align: left; font-weight: 400; }
+th { padding-top: 0; color: var(--ink-2); font-size: var(--text-footnote); }
+tbody tr + tr td { border-top: 1px solid var(--separator); }
+tbody td:first-child { font-weight: 600; }
+.num { width: 6rem; text-align: right; }
+
+.foot { display: grid; gap: var(--space-1); padding-inline: var(--space-1); }
+.foot-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-5);
+}
+.legend { display: flex; align-items: center; gap: var(--space-2); }
+.legend .ring { --ring-size: 1.25rem; flex: none; margin: 0; }
+.footnote { text-wrap: pretty; }
+
+@media (max-width: 40rem) {
+  :root { --text-large: 1.625rem; }
+  .gauges { gap: var(--space-4) var(--space-2); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .content, button { transition: none; }
+  button:active:not(:disabled) { transform: none; }
+}
+@media (forced-colors: active) {
+  .card { border: 1px solid CanvasText; }
+  .ring svg { forced-color-adjust: none; }
+  .ring-track, .ring.idle .ring-track { stroke: GrayText; }
+  .ring-fill, .ring.warning .ring-fill, .ring.critical .ring-fill, .ring-infinity { stroke: Highlight; }
+  .ring-time { stroke: CanvasText; }
+}
+</style>
+</head>
+<body>
+<main class="page" id="main">
+  <header class="top">
+    <h1>AI 额度</h1>
+    <div class="actions">
+      <span id="updated"></span>
+      <button type="button" id="refresh">刷新</button>
+    </div>
+  </header>
+  <p class="banner" id="banner" role="alert" hidden>
+    连不上本机服务，可能已闲置退出。在终端运行 <code>ai-quota ui</code> 重新打开。
+  </p>
+  <div class="content" id="content"></div>
+</main>
+<template id="ring-template">
+  <svg viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+    <circle class="ring-track" cx="50" cy="50" r="40" fill="none" stroke-width="10"></circle>
+    <circle class="ring-fill" cx="50" cy="50" r="40" fill="none" stroke-width="10" stroke-linecap="round"></circle>
+    <circle class="ring-time" cx="50" cy="50" r="48.5" fill="none" stroke-width="2" stroke-linecap="round" transform="rotate(-90 50 50)"></circle>
+  </svg>
+</template>
+<template id="infinity-template">
+  <svg viewBox="0 0 100 100" aria-hidden="true" focusable="false">
+    <circle class="ring-track" cx="50" cy="50" r="40" fill="none" stroke-width="10"></circle>
+    <path class="ring-infinity" d="M50 50C57 40 74 38 74 50C74 62 57 60 50 50C43 40 26 38 26 50C26 62 43 60 50 50Z" pathLength="100" fill="none" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"></path>
+  </svg>
+</template>
+<script id="report" type="application/json">__REPORT_JSON__</script>
+<script>
+(function () {
+  "use strict";
+
+  var REFRESH_MS = 60000;
+  var CLOCK_MS = 30000;
+  // 切回页面时补刷新，但距离上次请求太近就不发，避免频繁切换时连发请求。
+  var VISIBLE_REFRESH_GAP_MS = 30000;
+  var STALE_SECONDS = 1800;
+  var AHEAD_POINTS = 5;
+  var WEEKDAYS = "日一二三四五六";
+  // 和模板里两个圆的半径、线宽一致。
+  var USAGE_RADIUS = 40;
+  var USAGE_WIDTH = 10;
+  var TIME_RADIUS = 48.5;
+  var USAGE_LENGTH = 2 * Math.PI * USAGE_RADIUS;
+  var TIME_LENGTH = 2 * Math.PI * TIME_RADIUS;
+  var DRAW_MS = 900;
+  // 一屏放不下时整页缩小，最多缩到这个比例，再小字就看不清了，宁可滚动。窄于这个宽度（手机）不缩。
+  var FIT_MIN_SCALE = 0.8;
+  var FIT_MIN_WIDTH = 640;
+
+  var report = JSON.parse(document.getElementById("report").textContent);
+  var main = document.getElementById("main");
+  var content = document.getElementById("content");
+  var updated = document.getElementById("updated");
+  var banner = document.getElementById("banner");
+  var refresh = document.getElementById("refresh");
+  var ringTemplate = document.getElementById("ring-template");
+  var infinityTemplate = document.getElementById("infinity-template");
+  var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  var loading = false;
+  var lastRequestAt = Date.now();
+  var rendered = false;
+  // 只在第一次渲染时收集圆环，画一次进场动画。之后的定时刷新直接显示结果。
+  var pendingDraws = null;
+  var fitQueued = false;
+
+  function nowSeconds() { return Date.now() / 1000; }
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function two(value) { return String(value).padStart(2, "0"); }
+
+  function clock(date) { return two(date.getHours()) + ":" + two(date.getMinutes()); }
+
+  function formatReset(epoch, now) {
+    var target = new Date(epoch * 1000);
+    var today = new Date(now * 1000);
+    var dayOf = function (d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(); };
+    var days = Math.round((dayOf(target) - dayOf(today)) / 86400000);
+    if (days === 0) return "今天 " + clock(target);
+    if (days === 1) return "明天 " + clock(target);
+    if (days > 1 && days < 7) return "周" + WEEKDAYS[target.getDay()] + " " + clock(target);
+    return (target.getMonth() + 1) + "月" + target.getDate() + "日 " + clock(target);
+  }
+
+  function formatDuration(seconds) {
+    var minutes = Math.floor(seconds / 60);
+    if (minutes < 1) return "不到 1 分钟";
+    if (minutes < 60) return minutes + " 分钟";
+    var hours = Math.floor(minutes / 60);
+    if (hours < 24) return hours + " 小时 " + (minutes % 60) + " 分钟";
+    return Math.floor(hours / 24) + " 天 " + (hours % 24) + " 小时";
+  }
+
+  function formatAgo(seconds) {
+    if (seconds < 60) return "刚刚";
+    if (seconds < 3600) return Math.floor(seconds / 60) + " 分钟前";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + " 小时前";
+    return Math.floor(seconds / 86400) + " 天前";
+  }
+
+  function formatTokens(value) {
+    if (value >= 1e9) return (value / 1e9).toFixed(1) + "B";
+    if (value >= 1e6) return (value / 1e6).toFixed(1) + "M";
+    if (value >= 1e3) return (value / 1e3).toFixed(1) + "K";
+    return String(Math.round(value));
+  }
+
+  function percent(value) { return Math.round(value) + "%"; }
+
+  function severity(used) {
+    if (used >= 95) return { name: "critical", icon: "!", label: "快用完" };
+    if (used >= 80) return { name: "warning", icon: "▲", label: "接近上限" };
+    return null;
+  }
+
+  // 窗口已过去的时间比例。不知道窗口长度时返回 null，不画外圈细弧。
+  function elapsedShare(win, now) {
+    if (!win.window_seconds) return null;
+    var share = 1 - (win.resets_at - now) / win.window_seconds;
+    return Math.min(Math.max(share, 0), 1);
+  }
+
+  // Antigravity 的窗口按模型分组，名字前要带组名才说得清是哪个额度。
+  function windowName(win) { return win.group ? win.group + " " + win.name : win.name; }
+
+  function newestSeen(windows) {
+    return windows.reduce(function (latest, win) { return Math.max(latest, win.seen_at); }, 0);
+  }
+
+  function groupCount(windows) {
+    var count = 0;
+    var current = null;
+    windows.forEach(function (win, index) {
+      var key = win.group || "";
+      if (index === 0 || key !== current) count += 1;
+      current = key;
+    });
+    return count;
+  }
+
+  function tightest(now) {
+    var best = null;
+    report.quota.forEach(function (service) {
+      service.windows.forEach(function (win) {
+        if (win.resets_at <= now) return;
+        if (!best || win.used_percent > best.win.used_percent) best = { service: service, win: win };
+      });
+    });
+    return best;
+  }
+
+  // 圆头会在两端各多出半个线宽：弧长先扣掉一个线宽，起点再往后挪半个线宽，看上去才和数值一致。
+  // 用量很小时剩一个圆点，保证看得见。
+  function usageDash(used) {
+    return Math.max(used / 100 * USAGE_LENGTH - USAGE_WIDTH, 0.001) + " " + USAGE_LENGTH;
+  }
+
+  function timeDash(share) { return share * TIME_LENGTH + " " + TIME_LENGTH; }
+
+  function ringGraphic(used, share) {
+    var graphic = ringTemplate.content.firstElementChild.cloneNode(true);
+    var fill = graphic.querySelector(".ring-fill");
+    var time = graphic.querySelector(".ring-time");
+    if (used > 0) {
+      fill.setAttribute("transform", "rotate(" + (USAGE_WIDTH / 2 / USAGE_LENGTH * 360 - 90) + " 50 50)");
+      fill.setAttribute("stroke-dasharray", usageDash(used));
+    } else {
+      fill.remove();
+      fill = null;
+    }
+    // 窗口刚开始时细弧太短，只剩一个点，不画。
+    if (share !== null && share * TIME_LENGTH >= 1) {
+      time.setAttribute("stroke-dasharray", timeDash(share));
+    } else {
+      time.remove();
+      time = null;
+    }
+    if (pendingDraws && (fill || time)) pendingDraws.push({ fill: fill, time: time, used: used, share: share });
+    return graphic;
+  }
+
+  function drawIn(items) {
+    if (!items.length || reduceMotion.matches) return;
+    function paint(progress) {
+      items.forEach(function (item) {
+        if (item.fill) item.fill.setAttribute("stroke-dasharray", usageDash(item.used * progress));
+        if (item.time) item.time.setAttribute("stroke-dasharray", timeDash(item.share * progress));
+        if (item.infinity) {
+          // 无限符号沿着笔画描出来。画完去掉虚线设置，闭合处不留缝。
+          if (progress >= 1) item.infinity.removeAttribute("stroke-dasharray");
+          else item.infinity.setAttribute("stroke-dasharray", progress * 100 + " 100");
+        }
+      });
+    }
+    var start = null;
+    var skipped = false;
+    function frame(at) {
+      if (skipped) return;
+      if (start === null) start = at;
+      var t = Math.min((at - start) / DRAW_MS, 1);
+      paint(t >= 1 ? 1 : 1 - Math.pow(1 - t, 4));
+      if (t < 1) window.requestAnimationFrame(frame);
+    }
+    paint(0);
+    window.requestAnimationFrame(frame);
+    // 后台标签页里浏览器不跑动画帧。迟迟没开始就直接显示结果，不让圆环停在起点。
+    window.setTimeout(function () {
+      if (start !== null) return;
+      skipped = true;
+      paint(1);
+    }, 300);
+  }
+
+  function renderSummary(now) {
+    var section = el("section", "summary");
+    var best = tightest(now);
+    if (!best) {
+      section.append(el("p", "summary-main", "还没有可用的额度记录"));
+      return section;
+    }
+    // 中文在哪都能断行。服务名和窗口名各自不拆开，避免“每周”这种词被折到两行。
+    var headline = el("p", "summary-main", "最紧的是 ");
+    headline.append(
+      el("span", "keep", best.service.label),
+      " ",
+      el("span", "keep", windowName(best.win) + "额度"),
+      "，",
+      el("span", "keep", "已用 " + percent(best.win.used_percent))
+    );
+    section.append(headline);
+    section.append(el(
+      "p",
+      "summary-sub",
+      formatReset(best.win.resets_at, now) + " 重置，还有 " + formatDuration(best.win.resets_at - now) +
+        "，记录于 " + formatAgo(now - best.win.seen_at)
+    ));
+    return section;
+  }
+
+  function renderRing(service, win, now, expired) {
+    var level = expired ? null : severity(win.used_percent);
+    var ring = el("div", "ring" + (expired ? " idle" : level ? " " + level.name : ""));
+    var share = expired ? null : elapsedShare(win, now);
+    var used = expired ? 0 : Math.min(Math.max(win.used_percent, 0), 100);
+    var description = service.label + " " + windowName(win) + (expired ? "已重置" : "已用 " + percent(used));
+    if (share !== null) description += "，窗口时间已过 " + percent(share * 100);
+    ring.setAttribute("role", "meter");
+    ring.setAttribute("aria-valuemin", "0");
+    ring.setAttribute("aria-valuemax", "100");
+    ring.setAttribute("aria-valuenow", String(Math.round(used)));
+    ring.setAttribute("aria-label", description);
+    ring.title = description;
+    ring.append(ringGraphic(used, share));
+
+    var value = el("span", "ring-value");
+    value.setAttribute("aria-hidden", "true");
+    if (expired) {
+      value.textContent = "已重置";
+    } else {
+      value.append(el("span", "ring-number", String(Math.round(win.used_percent))), el("span", "ring-unit", "%"));
+    }
+    ring.append(value);
+    return ring;
+  }
+
+  function renderFlags(win, now) {
+    var flags = el("div", "gauge-flags");
+    var level = severity(win.used_percent);
+    var share = elapsedShare(win, now);
+    if (level) {
+      var line = el("div");
+      var icon = el("i", "flag-icon " + level.name, level.icon);
+      icon.setAttribute("aria-hidden", "true");
+      line.append(icon, level.label);
+      flags.append(line);
+    }
+    if (share !== null) {
+      var ahead = Math.round(win.used_percent - share * 100);
+      if (ahead >= AHEAD_POINTS) flags.append(el("div", "", "用得比时间快 " + ahead + " 个点"));
+    }
+    return flags.childNodes.length ? flags : null;
+  }
+
+  function renderGauge(service, win, now) {
+    var expired = win.resets_at <= now;
+    var gauge = el("div", "gauge");
+    gauge.append(renderRing(service, win, now, expired));
+    gauge.append(el("div", "gauge-name", win.name));
+    if (expired) {
+      gauge.append(el("div", "gauge-reset", "下次使用后更新"));
+      return gauge;
+    }
+    // 圆环下面很窄，时刻和倒计时各占一行，“重置”跟在倒计时后面。
+    gauge.append(el("div", "gauge-reset", formatReset(win.resets_at, now)));
+    gauge.append(el("div", "gauge-reset", formatDuration(win.resets_at - now) + "后重置"));
+    var flags = renderFlags(win, now);
+    if (flags) gauge.append(flags);
+    return gauge;
+  }
+
+  // 本地模型没有额度：底环加一个无限符号，下面说明为什么不限。
+  function renderUnlimited(service) {
+    var gauge = el("div", "gauge");
+    var ring = el("div", "ring unlimited");
+    ring.setAttribute("role", "img");
+    ring.setAttribute("aria-label", service.label + " 不限额度");
+    ring.title = service.label + " 不限额度";
+    var graphic = infinityTemplate.content.firstElementChild.cloneNode(true);
+    if (pendingDraws) pendingDraws.push({ infinity: graphic.querySelector(".ring-infinity") });
+    ring.append(graphic);
+    gauge.append(
+      ring,
+      el("div", "gauge-name", "不限额度"),
+      el("div", "gauge-reset", service.detail || "本地部署"),
+      el("div", "gauge-reset", "没有时间窗口")
+    );
+    return gauge;
+  }
+
+  // 相邻且组名相同的窗口放进同一组，没有组名的服务就是一个不带标题的组。
+  function renderGroups(service, now) {
+    var grouped = service.windows.some(function (win) { return win.group; });
+    var groups = el("div", "groups" + (grouped ? "" : " single"));
+    var current = null;
+    var gauges = null;
+    service.windows.forEach(function (win) {
+      var key = win.group || "";
+      if (!gauges || key !== current) {
+        current = key;
+        var group = el("div", "group");
+        if (win.group) group.append(el("h3", "group-name", win.group));
+        gauges = el("div", "gauges");
+        group.append(gauges);
+        groups.append(group);
+      }
+      gauges.append(renderGauge(service, win, now));
+    });
+    return groups;
+  }
+
+  function renderService(service, now) {
+    var count = service.windows.length;
+    var card = el("section", "card service" + (count || service.unlimited ? "" : " empty"));
+    card.style.setProperty("--span", String(Math.max(count, 1)));
+    card.style.setProperty("--groups", String(Math.max(groupCount(service.windows), 1)));
+    var head = el("div", "card-head");
+    var name = el("h2", "service-name", service.name);
+    name.title = service.name;
+    var meta = el("div", "service-meta");
+    if (service.plan) meta.append(el("span", "plan", service.plan));
+    var seen = newestSeen(service.windows);
+    if (seen) {
+      var stamp = el("span", "service-seen", "记录于 " + formatAgo(now - seen));
+      stamp.title = stamp.textContent;
+      meta.append(stamp);
+    }
+    head.append(name, meta);
+    card.append(head);
+    if (service.unlimited) {
+      var single = el("div", "groups single");
+      var group = el("div", "group");
+      var gauges = el("div", "gauges");
+      gauges.append(renderUnlimited(service));
+      group.append(gauges);
+      single.append(group);
+      card.append(single);
+    } else if (count) {
+      card.append(renderGroups(service, now));
+    } else if (service.note) {
+      card.append(el("p", "service-note", service.note));
+    }
+    return card;
+  }
+
+  function renderTokens() {
+    var section = el("section", "card tokens");
+    section.append(el("h2", "", "本机 token"));
+    section.append(el("p", "caption", "不含缓存读取和其他设备，按滚动窗口统计，和额度窗口不是一回事。"));
+    var table = el("table");
+    var head = el("tr");
+    head.append(el("th", "", "服务"), el("th", "num", "近 5 小时"), el("th", "num", "近 7 天"));
+    head.querySelectorAll("th").forEach(function (cell) { cell.scope = "col"; });
+    var thead = el("thead");
+    thead.append(head);
+    var tbody = el("tbody");
+    report.tokens.forEach(function (item) {
+      var row = el("tr");
+      row.append(
+        el("td", "", item.label),
+        el("td", "num", formatTokens(item.five_hours)),
+        el("td", "num", formatTokens(item.seven_days))
+      );
+      tbody.append(row);
+    });
+    table.append(thead, tbody);
+    var wrap = el("div", "table-wrap");
+    wrap.append(table);
+    section.append(wrap);
+    return section;
+  }
+
+  function renderFoot(now) {
+    var foot = el("footer", "foot");
+    var row = el("div", "foot-row");
+    var legend = el("p", "legend");
+    var sample = el("span", "ring");
+    sample.setAttribute("aria-hidden", "true");
+    sample.append(ringGraphic(62, 0.45));
+    legend.append(sample, el("span", "", "粗环是用量，外圈细弧是窗口已过去的时间。粗环比细弧长，说明用得比时间快。"));
+    row.append(legend);
+    var claude = report.quota.filter(function (service) { return service.service === "claude"; })[0];
+    var seen = claude ? newestSeen(claude.windows) : 0;
+    if (claude && (!seen || now - seen > STALE_SECONDS)) {
+      var hint = el("p", "", "Claude 的额度只在终端里更新，发一句就能刷新：");
+      hint.append(el("code", "", 'claude --model haiku "ok"'));
+      row.append(hint);
+    }
+    foot.append(row, el(
+      "p",
+      "footnote",
+      "数据来自本机的官方客户端，Antigravity 由官方命令 agy 每几分钟查一次。本工具不登录、不读凭据，数字不是实时值。"
+    ));
+    return foot;
+  }
+
+  function fitsAt(scale) {
+    main.style.zoom = scale === 1 ? "" : String(scale);
+    return document.documentElement.scrollHeight <= window.innerHeight;
+  }
+
+  // 一屏放不下时把整页等比缩小。缩小后可用宽度变大，卡片可能从三行变两行，高度会突然变矮，
+  // 所以按比例一次算不准。比例越小越容易放下，用二分找能放下的最大比例。
+  function fitToScreen() {
+    fitQueued = false;
+    if (window.innerWidth < FIT_MIN_WIDTH) {
+      main.style.zoom = "";
+      return;
+    }
+    if (fitsAt(1)) return;
+    // 缩到最小还放不下，就停在最小比例，剩下的靠滚动。
+    if (!fitsAt(FIT_MIN_SCALE)) return;
+    var low = FIT_MIN_SCALE;
+    var high = 1;
+    for (var i = 0; i < 6; i++) {
+      var middle = (low + high) / 2;
+      if (fitsAt(middle)) low = middle;
+      else high = middle;
+    }
+    fitsAt(low);
+  }
+
+  function queueFit() {
+    if (fitQueued) return;
+    fitQueued = true;
+    window.requestAnimationFrame(fitToScreen);
+  }
+
+  function render() {
+    var now = nowSeconds();
+    pendingDraws = rendered ? null : [];
+    rendered = true;
+    updated.textContent = "更新于 " + clock(new Date(report.generated_at * 1000));
+    // 不分组的小卡片排在前面占一行，分组的大卡片和 token 表排第二行，两行就能放完。
+    var board = el("div", "board");
+    var grouped = function (service) { return groupCount(service.windows) > 1; };
+    report.quota.filter(function (service) { return !grouped(service); })
+      .concat(report.quota.filter(grouped))
+      .forEach(function (service) { board.append(renderService(service, now)); });
+    board.append(renderTokens());
+    content.replaceChildren(renderSummary(now), board, renderFoot(now));
+    var items = pendingDraws;
+    pendingDraws = null;
+    fitToScreen();
+    if (items) drawIn(items);
+  }
+
+  function load(fresh) {
+    if (loading) return;
+    loading = true;
+    lastRequestAt = Date.now();
+    if (fresh) {
+      refresh.disabled = true;
+      refresh.textContent = "读取中…";
+      main.setAttribute("aria-busy", "true");
+    }
+    fetch("/api/report" + (fresh ? "?fresh=1" : ""), { cache: "no-store" })
+      .then(function (response) {
+        if (!response.ok) throw new Error(String(response.status));
+        return response.json();
+      })
+      .then(function (data) {
+        report = data;
+        banner.hidden = true;
+        render();
+      })
+      .catch(function () {
+        banner.hidden = false;
+        queueFit();
+      })
+      .finally(function () {
+        loading = false;
+        refresh.disabled = false;
+        refresh.textContent = "刷新";
+        main.removeAttribute("aria-busy");
+      });
+  }
+
+  refresh.addEventListener("click", function () { load(true); });
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && Date.now() - lastRequestAt > VISIBLE_REFRESH_GAP_MS) load(false);
+  });
+  window.addEventListener("resize", queueFit);
+  setInterval(function () { load(false); }, REFRESH_MS);
+  setInterval(render, CLOCK_MS);
+  render();
+})();
+</script>
+</body>
+</html>
