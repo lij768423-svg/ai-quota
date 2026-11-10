@@ -358,7 +358,7 @@ tbody td:first-child { font-weight: 600; }
     <h1>AI 额度</h1>
     <div class="actions">
       <span id="updated"></span>
-      <button type="button" id="refresh">刷新</button>
+      <button type="button" id="refresh" title="让各家官方客户端重新查一次额度，大约 5 秒，不花额度">刷新</button>
     </div>
   </header>
   <p class="banner" id="banner" role="alert" hidden>
@@ -768,17 +768,23 @@ tbody td:first-child { font-weight: 600; }
     sample.append(ringGraphic(62, 0.45));
     legend.append(sample, el("span", "", "粗环是用量，外圈细弧是窗口已过去的时间。粗环比细弧长，说明用得比时间快。"));
     row.append(legend);
-    var claude = report.quota.filter(function (service) { return service.service === "claude"; })[0];
-    var seen = claude ? newestSeen(claude.windows) : 0;
-    if (claude && (!seen || now - seen > STALE_SECONDS)) {
-      var hint = el("p", "", "Claude 的额度只在终端里更新，发一句就能刷新：");
-      hint.append(el("code", "", 'claude --model haiku "ok"'));
-      row.append(hint);
+    var failed = (report.refresh || []).filter(function (item) { return !item.ok; });
+    var stale = report.quota.filter(function (service) {
+      var seen = newestSeen(service.windows);
+      return service.windows.length && now - seen > STALE_SECONDS;
+    });
+    if (failed.length) {
+      row.append(el("p", "", "这次没刷新成功：" + failed.map(function (item) {
+        return item.name + "（" + item.message + "）";
+      }).join("，")));
+    } else if (stale.length) {
+      row.append(el("p", "", stale.map(function (service) { return service.name; }).join("、") +
+        " 的数据超过 30 分钟了，点右上角的“刷新”重新查。"));
     }
     foot.append(row, el(
       "p",
       "footnote",
-      "数据来自本机的官方客户端，Antigravity 由官方命令 agy 每几分钟查一次。本工具不登录、不读凭据，数字不是实时值。"
+      "数据来自本机的官方客户端。点“刷新”会让各家客户端用自己的只读方式重新查一次，不开对话、不花额度。本工具不登录、不读凭据。"
     ));
     return foot;
   }
@@ -840,7 +846,7 @@ tbody td:first-child { font-weight: 600; }
     lastRequestAt = Date.now();
     if (fresh) {
       refresh.disabled = true;
-      refresh.textContent = "读取中…";
+      refresh.textContent = "刷新中…";
       main.setAttribute("aria-busy", "true");
     }
     fetch("/api/report" + (fresh ? "?fresh=1" : ""), { cache: "no-store" })

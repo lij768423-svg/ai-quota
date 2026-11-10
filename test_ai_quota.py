@@ -7,6 +7,7 @@ import queue
 import re
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -222,7 +223,7 @@ class GrokLimitsTest(TempHome):
             },
         }
 
-    def test_logged_out_records_are_skipped_and_latest_period_wins(self):
+    def test_logged_out_records_are_skipped_and_latest_record_wins(self):
         old_end = NOW + 3600
         new_end = NOW + 5 * 86400
         write_jsonl(
@@ -238,9 +239,32 @@ class GrokLimitsTest(TempHome):
         limits = ai_quota.read_grok_limits(self.home, NOW)
         window = limits["windows"]["每周"]
         self.assertEqual(limits["plan"], "SuperGrok")
-        self.assertEqual(window["used_percent"], 17.0)
+        # 每条都是服务器当时给的值，用量变少也以最新的为准（实际遇到过同一周期 17% 变成 2%）。
+        self.assertEqual(window["used_percent"], 14.0)
         self.assertEqual(window["resets_at"], int(new_end))
         self.assertEqual(window["seen_at"], NOW - 50)
+
+    def test_refresh_snapshot_newer_than_log_wins(self):
+        end = NOW + 5 * 86400
+        write_jsonl(self.path(), [self.event(NOW - 600, 17.0, end - 7 * 86400, end)])
+        snapshot = {
+            "fetched_at": NOW - 10,
+            "plan": "SuperGrok Heavy",
+            "config": {
+                "creditUsagePercent": 2.0,
+                "currentPeriod": {
+                    "start": datetime.fromtimestamp(end - 7 * 86400, timezone.utc).isoformat(),
+                    "end": datetime.fromtimestamp(end, timezone.utc).isoformat(),
+                },
+            },
+        }
+        ai_quota.write_json_atomic(ai_quota.state_file(self.home, "grok.json"), snapshot)
+        limits = ai_quota.read_grok_limits(self.home, NOW)
+        self.assertEqual((limits["plan"], limits["windows"]["每周"]["used_percent"]), ("SuperGrok Heavy", 2.0))
+        # 之后客户端又写了更新的日志，日志为准。
+        write_jsonl(self.path(), [self.event(NOW - 600, 17.0, end - 7 * 86400, end), self.event(NOW - 5, 3.0, end - 7 * 86400, end)])
+        limits = ai_quota.read_grok_limits(self.home, NOW)
+        self.assertEqual((limits["plan"], limits["windows"]["每周"]["used_percent"]), ("SuperGrok", 3.0))
 
     def test_other_messages_with_same_words_are_ignored(self):
         end = NOW + 86400
@@ -482,6 +506,233 @@ class AgyUsageTest(TempHome):
         self.assertEqual({w["group"] for w in codex["windows"]}, {None})
 
 
+FAKE_SERVER = r'''
+import json, os, sys, time
+replies = json.loads(os.environ["FAKE_REPLIES"])
+for line in sys.stdin:
+    message = json.loads(line)
+    if "id" not in message:
+        continue
+    # 真实客户端会穿插通知和反向请求，这些都要被跳过。
+    sys.stdout.write(json.dumps({"method": "notice"}) + "\n")
+    sys.stdout.write(json.dumps({"id": message["id"], "method": "server/ask"}) + "\n")
+    sys.stdout.write("not json\n")
+    sys.stdout.flush()
+    reply = replies.get(message.get("method"))
+    if reply == "sleep":
+        time.sleep(30)
+    if reply == "exit":
+        sys.exit(0)
+    out = {"id": message["id"]}
+    if reply is None:
+        out["error"] = {"code": -32601, "message": "Method not found"}
+    else:
+        out["result"] = dict(reply, _jsonrpc=message.get("jsonrpc"), _params=message.get("params"))
+    sys.stdout.write(json.dumps(out) + "\n")
+    sys.stdout.flush()
+'''
+
+FAKE_CLAUDE = r'''
+import json, os, sys
+assert sys.argv[1:3] == ["-p", "/usage"], sys.argv
+assert "--no-session-persistence" in sys.argv, sys.argv
+print(json.dumps({"type": "result", "num_turns": 0, "result": os.environ["FAKE_USAGE_TEXT"]}))
+'''
+
+USAGE_TEXT = """You are currently using your subscription to power your Claude Code usage
+
+Current session: 24% used · resets Nov 10 at 1:59am (America/Los_Angeles)
+Current week (all models): 39% used · resets Nov 15 at 4:59am (America/Los_Angeles)
+Current week (Fable): 3% used · resets Nov 15 at 4:59am (America/Los_Angeles)
+
+Last 24h · 2899 requests · 14 sessions"""
+
+CODEX_LIMITS = {
+    "accountId": "acct-secret",
+    "rateLimits": {"limitId": "codex", "primary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": int(NOW + 4 * 86400)}, "secondary": None, "planType": "prolite"},
+    "rateLimitsByLimitId": {
+        "codex": {"limitId": "codex", "primary": {"usedPercent": 61, "windowDurationMins": 10080, "resetsAt": int(NOW + 4 * 86400)}, "secondary": None, "planType": "prolite"},
+    },
+}
+
+
+def la_time(*parts):
+    from zoneinfo import ZoneInfo
+
+    return datetime(*parts, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp()
+
+
+class RefreshTest(TempHome):
+    def script(self, name, body):
+        path = os.path.join(self.home, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("#!{}\n{}".format(sys.executable, body))
+        os.chmod(path, 0o755)
+        return path
+
+    def fake_server(self, replies):
+        patcher = mock.patch.dict(os.environ, {"FAKE_REPLIES": json.dumps(replies)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return self.script("server.py", FAKE_SERVER)
+
+    def test_parse_claude_usage(self):
+        now = la_time(2026, 11, 10, 0, 30)
+        found = ai_quota.parse_claude_usage(USAGE_TEXT, now)
+        self.assertEqual(set(found), {"five_hour", "seven_day"})
+        self.assertEqual(found["five_hour"], {"used_percent": 24.0, "resets_at": int(la_time(2026, 11, 10, 1, 59)), "seen_at": now})
+        self.assertEqual(found["seven_day"]["used_percent"], 39.0)
+        self.assertEqual(found["seven_day"]["resets_at"], int(la_time(2026, 11, 15, 4, 59)))
+        self.assertEqual(ai_quota.parse_claude_usage("nothing here", now), {})
+        self.assertEqual(ai_quota.parse_claude_usage(None, now), {})
+
+    def test_claude_reset_times(self):
+        now = la_time(2026, 12, 30, 22, 0)
+        self.assertEqual(ai_quota.parse_claude_reset("resets Jan 2 at 5am (America/Los_Angeles)", now), la_time(2027, 1, 2, 5, 0))
+        self.assertEqual(ai_quota.parse_claude_reset("resets 11:15pm (America/Los_Angeles)", now), la_time(2026, 12, 30, 23, 15))
+        self.assertEqual(ai_quota.parse_claude_reset("resets 3:15am (America/Los_Angeles)", now), la_time(2026, 12, 31, 3, 15))
+        self.assertEqual(ai_quota.parse_claude_reset("resets 12pm (America/Los_Angeles)", now), la_time(2026, 12, 31, 12, 0))
+        self.assertIsNone(ai_quota.parse_claude_reset("resets soon", now))
+        self.assertIsNone(ai_quota.parse_claude_reset("resets Foo 2 at 5am", now))
+
+    def test_parse_codex_rate_limits_drops_account(self):
+        limits = ai_quota.parse_codex_rate_limits(CODEX_LIMITS, NOW)
+        self.assertEqual(limits, {"codex": {"plan": "prolite", "windows": {"每周": {"used_percent": 61.0, "resets_at": int(NOW + 4 * 86400), "seen_at": NOW}}}})
+        only_single = {"rateLimits": CODEX_LIMITS["rateLimits"]}
+        self.assertEqual(ai_quota.parse_codex_rate_limits(only_single, NOW), limits)
+        self.assertEqual(ai_quota.parse_codex_rate_limits({}, NOW), {})
+
+    def test_codex_snapshot_is_merged_with_logs(self):
+        write_jsonl(os.path.join(self.home, ".codex", "sessions", "a.jsonl"), [token_count(NOW - 3600, primary=18, secondary=82)])
+        ai_quota.write_json_atomic(
+            ai_quota.state_file(self.home, "codex.json"),
+            {"fetched_at": NOW - 10, "limits": ai_quota.parse_codex_rate_limits(CODEX_LIMITS, NOW - 10)},
+        )
+        limits, _ = ai_quota.read_codex(self.home, NOW)
+        self.assertEqual(limits["codex"]["plan"], "prolite")
+        self.assertEqual(list(limits["codex"]["windows"]), ["每周"])
+        self.assertEqual(limits["codex"]["windows"]["每周"]["used_percent"], 61.0)
+
+    def test_rpc_exchange_skips_noise_and_returns_last_result(self):
+        server = self.fake_server({"initialize": {"ok": True}, "read": {"value": 7}})
+        result = ai_quota.rpc_exchange(
+            [server],
+            [("initialize", {"a": 1}, True), ("initialized", None, False), ("read", {"x": 1}, True)],
+            cwd=self.home,
+            jsonrpc=True,
+        )
+        self.assertEqual(result, {"value": 7, "_jsonrpc": "2.0", "_params": {"x": 1}})
+
+    def test_rpc_exchange_failures(self):
+        cases = (
+            ({"initialize": {"ok": True}}, "客户端拒绝了请求"),
+            ({"initialize": "exit"}, "客户端提前退出"),
+            ({"initialize": "sleep"}, "超时"),
+        )
+        for replies, message in cases:
+            server = self.fake_server(replies)
+            with self.assertRaises(ai_quota.RefreshError) as caught:
+                ai_quota.rpc_exchange([server], [("initialize", {}, True), ("read", {}, True)], cwd=self.home, timeout=1.5)
+            self.assertEqual(str(caught.exception), message)
+        with self.assertRaises(ai_quota.RefreshError):
+            ai_quota.rpc_exchange([os.path.join(self.home, "missing")], [("x", {}, True)], cwd=self.home)
+
+    def test_refresh_claude_keeps_only_numbers(self):
+        ai_quota.write_json_atomic(ai_quota.state_path(self.home), {"other": {"used_percent": 1, "resets_at": 1, "seen_at": 1}})
+        fake = self.script("claude", FAKE_CLAUDE)
+        now = la_time(2026, 11, 10, 0, 30)
+        with mock.patch("ai_quota.find_binary", return_value=fake), mock.patch.dict(os.environ, {"FAKE_USAGE_TEXT": USAGE_TEXT}):
+            ai_quota.refresh_claude(self.home, now)
+        state = ai_quota.load_claude_state(self.home)
+        self.assertEqual(set(state), {"other", "five_hour", "seven_day"})
+        self.assertEqual(state["five_hour"]["used_percent"], 24.0)
+        with mock.patch("ai_quota.find_binary", return_value=fake), mock.patch.dict(os.environ, {"FAKE_USAGE_TEXT": "API usage billing"}):
+            with self.assertRaises(ai_quota.RefreshError):
+                ai_quota.refresh_claude(self.home, now)
+
+    def test_refresh_codex_and_grok_store_only_numbers(self):
+        end = NOW + 3 * 86400
+        server = self.fake_server(
+            {
+                "initialize": {"ok": True},
+                "account/rateLimits/read": CODEX_LIMITS,
+                "_x.ai/billing": {
+                    "config": {
+                        "creditUsagePercent": 2.0,
+                        "currentPeriod": {"start": iso(end - 7 * 86400), "end": iso(end)},
+                        "prepaidBalance": {"val": 0},
+                    },
+                    "subscription_tier": "SuperGrok",
+                },
+            }
+        )
+        with mock.patch("ai_quota.find_binary", return_value=server):
+            ai_quota.refresh_codex(self.home, NOW)
+            ai_quota.refresh_grok(self.home, NOW)
+        with open(ai_quota.state_file(self.home, "codex.json"), encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertNotIn("acct-secret", raw)
+        self.assertEqual(ai_quota.read_codex(self.home, NOW)[0]["codex"]["windows"]["每周"]["used_percent"], 61.0)
+        grok = ai_quota.load_json(ai_quota.state_file(self.home, "grok.json"))
+        self.assertEqual(set(grok), {"fetched_at", "plan", "config"})
+        self.assertEqual(set(grok["config"]), {"creditUsagePercent", "currentPeriod"})
+        limits = ai_quota.read_grok_limits(self.home, NOW)
+        self.assertEqual((limits["plan"], limits["windows"]["每周"]["used_percent"]), ("SuperGrok", 2.0))
+
+    def test_refresh_all_reports_each_client_and_skips_recent_success(self):
+        calls = []
+
+        def ok(home, now):
+            calls.append("ok")
+
+        def refused(home, now):
+            calls.append("refused")
+            raise ai_quota.RefreshError("没找到 grok 命令")
+
+        def broken(home, now):
+            calls.append("broken")
+            raise ValueError("secret detail")
+
+        refreshers = (("a", "A", ok), ("b", "B", refused), ("c", "C", broken))
+        self.addCleanup(ai_quota._last_refresh.clear)
+        results = ai_quota.refresh_all(self.home, NOW, min_gap=30, refreshers=refreshers)
+        self.assertEqual(
+            [(r["service"], r["ok"], r["message"]) for r in results],
+            [("a", True, "已更新"), ("b", False, "没找到 grok 命令"), ("c", False, "出错了：ValueError")],
+        )
+        calls.clear()
+        results = ai_quota.refresh_all(self.home, NOW + 10, min_gap=30, refreshers=refreshers)
+        self.assertEqual(sorted(calls), ["broken", "refused"])
+        self.assertEqual(results[0]["message"], "刚刷新过")
+        calls.clear()
+        ai_quota.refresh_all(self.home, NOW + 40, min_gap=30, refreshers=refreshers)
+        self.assertEqual(sorted(calls), ["broken", "ok", "refused"])
+        self.assertIn("没找到 grok 命令", ai_quota.render_refresh(results))
+
+    def test_temporary_home_never_runs_real_clients(self):
+        import subprocess as real_subprocess
+
+        with mock.patch.object(real_subprocess, "Popen", side_effect=AssertionError("ran")), mock.patch.object(
+            real_subprocess, "run", side_effect=AssertionError("ran")
+        ):
+            results = ai_quota.refresh_all(self.home, NOW)
+        self.assertEqual([r["service"] for r in results], ["claude", "codex", "grok", "antigravity"])
+        self.assertFalse(any(r["ok"] for r in results))
+
+    def test_cli_refresh(self):
+        results = [{"service": "claude", "name": "Claude", "ok": True, "message": "已更新"}]
+        with mock.patch("ai_quota.refresh_all", return_value=results), mock.patch(
+            "ai_quota.collect", return_value=ai_quota.collect(home=self.home, now=NOW)
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(ai_quota.main(["refresh"]), 0)
+        self.assertIn("让官方客户端重新查了一次额度", out.getvalue())
+        failed = [dict(results[0], ok=False, message="超时")]
+        with mock.patch("ai_quota.refresh_all", return_value=failed), mock.patch(
+            "ai_quota.collect", return_value=ai_quota.collect(home=self.home, now=NOW)
+        ), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(ai_quota.main(["refresh"]), 1)
+
+
 class StatuslineTest(TempHome):
     def run_with(self, payload, now=NOW):
         stream = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
@@ -680,14 +931,19 @@ class ReportStoreTest(unittest.TestCase):
             fresh_flags.append(fresh)
             return {"generated_at": now}
 
-        with mock.patch("ai_quota.collect", fake_collect):
+        refreshes = []
+        fake_refresh = lambda **kwargs: refreshes.append(kwargs) or []
+        with mock.patch("ai_quota.collect", fake_collect), mock.patch("ai_quota.refresh_all", fake_refresh):
             store = ai_quota.ReportStore(max_age=1000)
             store.get()
             store.get()
             self.assertEqual(len(calls), 1)
-            store.get(fresh=True)
+            self.assertEqual(refreshes, [])
+            report = store.get(fresh=True)
             self.assertEqual(len(calls), 2)
             self.assertEqual(fresh_flags, [False, True])
+            self.assertEqual(refreshes, [{"home": None, "min_gap": ai_quota.REFRESH_MIN_GAP_SECONDS}])
+            self.assertEqual(report["refresh"], [])
             expired = ai_quota.ReportStore(max_age=-1)
             expired.get()
             expired.get()
@@ -754,10 +1010,17 @@ class UiServerTest(unittest.TestCase):
         self.assertEqual(response.status, 200)
 
     def test_report_endpoint(self):
+        response, body = self.request("/api/report")
+        self.assertEqual(response.status, 200)
+        self.assertLessEqual({"generated_at", "quota", "tokens"}, set(json.loads(body)))
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+
+    def test_fresh_report_refreshes_but_never_queries_from_a_temporary_home(self):
         response, body = self.request("/api/report?fresh=1")
         self.assertEqual(response.status, 200)
-        self.assertEqual({"generated_at", "quota", "tokens"}, set(json.loads(body)))
-        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        refresh = json.loads(body)["refresh"]
+        self.assertEqual([item["service"] for item in refresh], ["claude", "codex", "grok", "antigravity"])
+        self.assertFalse(any(item["ok"] for item in refresh))
 
     def test_foreign_host_is_refused(self):
         response, body = self.request("/api/report", host="evil.example:{}".format(self.port))

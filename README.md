@@ -28,9 +28,9 @@ ln -s "$PWD/ai_quota.py" ~/.local/bin/ai-quota
 
 `~/.local/bin` 要在 `PATH` 里。
 
-### 让 Claude Code 写入额度
+### 可选：用 Claude Code 时自动更新
 
-Claude Code 不会把额度写进日志，只在终端界面刷新状态栏时把它传给 `statusLine` 命令。在 `~/.claude/settings.json` 里加上：
+Claude Code 不会把额度写进日志。点“刷新”或运行 `ai-quota refresh` 时，ai-quota 会用 `claude -p /usage` 查一次。如果想让平时在终端里用 Claude Code 时也顺带更新，可以配上状态栏：它在终端界面刷新状态栏时会把额度传给 `statusLine` 命令。在 `~/.claude/settings.json` 里加上：
 
 ```json
 {
@@ -61,6 +61,14 @@ ai-quota ui
 ai-quota
 ```
 
+一键刷新：让各家官方客户端重新查一次额度，再显示，大约 5 秒，不花额度：
+
+```bash
+ai-quota refresh
+```
+
+网页右上角的“刷新”按钮做的是同一件事。
+
 输出 JSON：
 
 ```bash
@@ -84,6 +92,19 @@ ai-quota --json
 | Grok | `~/.grok/logs/unified.jsonl` 里的 `creditUsagePercent`，登录 Grok Build 后才有 | 同一份日志 | `~/.grok/sessions/*/*/updates.jsonl` |
 | Antigravity | 官方命令 `agy -p /usage --output-format json`，结果存在 `~/.local/state/ai-quota/antigravity.json` | 桌面应用日志 `~/Library/Logs/Antigravity/language_server.log`，有值时才显示 | 没有 |
 
+### 一键刷新时怎么查
+
+四家并行，各用官方客户端自己的只读方式，都不开对话、不花额度，也不碰登录信息：
+
+| 服务 | 刷新时运行 | 存到 |
+|---|---|---|
+| Claude | `claude -p /usage --no-session-persistence --strict-mcp-config`，Claude Code 自带的额度命令 | `~/.local/state/ai-quota/claude.json` |
+| Codex | `codex app-server` 的 `account/rateLimits/read`，编辑器插件查额度用的就是它 | `~/.local/state/ai-quota/codex.json` |
+| Grok | `grok agent --no-leader stdio` 的 `_x.ai/billing`，不建会话 | `~/.local/state/ai-quota/grok.json` |
+| Antigravity | `agy -p /usage --output-format json` | `~/.local/state/ai-quota/antigravity.json` |
+
+只存百分比、重置时间和套餐名，账号 ID 之类的字段都丢掉。客户端在 `~/.local/state/ai-quota` 里启动，不会在你的项目里留东西。某一家没装或没登录，只有那一家显示失败，其他照常。网页上连点“刷新”时，30 秒内刷新成功过的那家不重复查。
+
 Codex 换套餐后，日志里的窗口也会变（比如 Pro 只有每周额度）。这里只显示最新套餐的窗口，旧套餐的数字不混进来。`prolite` 是每月 100 美元那一档，按 Codex 自己的叫法显示成 Pro。
 
 Antigravity 的 `/usage` 在 print 模式下不开对话、不花额度、不留会话记录，agy 的更新说明里写明了这一点。ai-quota 只运行这个命令、读它的输出，不碰它的登录信息，也不直接请求它的服务。保存时只留模型组名、用量百分比和时间，不存账号。平时 5 分钟最多查一次；点网页上的“刷新”或在终端运行 `ai-quota` 时是 1 分钟。查询失败后也等同样的时间再试。
@@ -106,12 +127,13 @@ token 不含缓存读取，只统计这台电脑，也不区分走官方还是�
 
 ## 限制
 
-- 数字只在官方客户端写入时更新，不是实时值。看“记录于”判断新旧，过了重置时间显示“已重置”。
-- Claude 的额度只有终端里的 Claude Code 会写入，桌面应用不会。
-- Grok 的额度在 Grok Build 启动时写入，用到一半不会更新。
+- 数字只在官方客户端写入或你点“刷新”时更新，不是实时值。看“记录于”判断新旧，过了重置时间显示“已重置”。超过 30 分钟没更新的，页面底部会提醒。
+- 不刷新的话，Claude 的额度只有终端里的 Claude Code 会通过状态栏写入，桌面应用不会。
+- 不刷新的话，Grok 的额度只在 Grok Build 启动时写入，用到一半不会更新。
+- `claude -p /usage` 输出的是给人看的文字，Claude Code 改了措辞就要跟着改解析。
 - Antigravity 还没用过的窗口，重置时间是查询时刻加上窗口长度，每次查询都会往后推，开始用之后才固定。
 - 在终端运行 `ai-quota` 时，如果距上次查 Antigravity 超过 1 分钟，会多等 3 秒左右。
-- 同一窗口内取见过的最大值，因为并发会话可能写入旧数字。服务商中途重置额度但重置时间没变时，数字会偏高。
+- Claude 状态栏和 Codex 日志在同一窗口内取见过的最大值，因为并发会话可能写入旧数字。服务商中途重置额度但重置时间没变时，数字会偏高，刷新一次就对了。Grok 的每条记录都是服务器当时给的值，以最新一条为准。
 - 这些日志格式都没有稳定性承诺，客户端更新后可能要跟着改。
 
 ## 卸载

@@ -9,6 +9,10 @@
                以及 ~/.grok/sessions 日志里的 token
   Antigravity  官方命令 `agy -p /usage --output-format json` 的输出，
                这个命令不开对话、不花额度，结果存在本地，几分钟查一次
+
+`ai-quota refresh`（和网页上的“刷新”）让四家客户端用各自的只读方式重新查一次：
+  claude -p /usage、codex app-server 的 account/rateLimits/read、
+  grok agent stdio 的 _x.ai/billing、agy -p /usage。都不开对话、不花额度。
 """
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ UI_REPORT_MAX_AGE = 20
 
 USAGE = """用法：
   ai-quota             显示各家额度和本机 token 用量
+  ai-quota refresh     让各家官方客户端重新查一次额度，再显示（不花额度）
   ai-quota --json      输出 JSON
   ai-quota ui          打开本机网页界面，闲置 10 分钟后服务自动退出
   ai-quota ui --serve  在前台运行网页服务
@@ -234,9 +239,23 @@ def read_codex(home, now):
     root = os.path.join(home, ".codex", "sessions")
     limits = {}
     events = {}
+    sources = []
     for path in recent_files(root, lambda n: n.endswith(".jsonl"), now - SEVEN_DAYS):
         file_limits, file_events = cached_parse(path, parse_codex_file)
         events.update(file_events)
+        sources.append(file_limits)
+    # `ai-quota refresh` 查到的结果，当作又一份日志并进来。
+    snapshot = load_json(state_file(home, "codex.json"))
+    fetched_at = snapshot.get("fetched_at")
+    if isinstance(fetched_at, (int, float)) and isinstance(snapshot.get("limits"), dict):
+        sources.append(
+            {
+                limit_id: {"plan": entry.get("plan"), "plan_seen_at": fetched_at, "plans": {entry.get("plan"): entry.get("windows") or {}}}
+                for limit_id, entry in snapshot["limits"].items()
+                if isinstance(entry, dict)
+            }
+        )
+    for file_limits in sources:
         for limit_id, entry in file_limits.items():
             merged = limits.setdefault(limit_id, {"plan": None, "plan_seen_at": None, "plans": {}})
             if merged["plan_seen_at"] is None or entry["plan_seen_at"] > merged["plan_seen_at"]:
@@ -344,47 +363,62 @@ def grok_window_name(start, end):
     return "每周" if days == 7 else "{} 天".format(days)
 
 
+def grok_window(config, seen_at):
+    """把 Grok 的 credits 配置换成 (窗口名, 窗口)。未登录时百分比为空，返回 None。"""
+    if not isinstance(config, dict) or not isinstance(seen_at, (int, float)):
+        return None
+    period = config.get("currentPeriod")
+    percent = config.get("creditUsagePercent")
+    if not isinstance(period, dict) or not isinstance(percent, (int, float)):
+        return None
+    end = iso_to_epoch(period.get("end"))
+    if end is None:
+        return None
+    name = grok_window_name(iso_to_epoch(period.get("start")), end)
+    return name, {"used_percent": float(percent), "resets_at": int(end), "seen_at": seen_at}
+
+
+def take_newer_grok(entry, name, window, plan):
+    """Grok 每条记录都是当时从服务器取的值，以最新的为准。
+
+    用量会变少（服务商重置或退回额度），所以不能像 Codex 那样取最大值。
+    """
+    current = entry["windows"].get(name)
+    if current is None or window["seen_at"] >= current["seen_at"]:
+        entry["windows"][name] = window
+    if plan and window["seen_at"] >= entry["plan_seen_at"]:
+        entry["plan"], entry["plan_seen_at"] = plan, window["seen_at"]
+
+
 def parse_grok_log(path):
-    """Grok Build 启动时会把额度写进日志。未登录时百分比为空，这种记录跳过。"""
-    entry = {"plan": None, "windows": {}}
+    """Grok Build 启动或查询额度时会把额度写进日志。"""
+    entry = {"plan": None, "plan_seen_at": 0, "windows": {}}
     for record in matching_records(path, (b"fetched credits config",)):
         context = record.get("ctx")
-        config = context.get("config") if isinstance(context, dict) else None
-        if not isinstance(config, dict) or record.get("msg") != "billing: fetched credits config":
+        if not isinstance(context, dict) or record.get("msg") != "billing: fetched credits config":
             continue
-        period = config.get("currentPeriod")
-        percent = config.get("creditUsagePercent")
-        seen_at = iso_to_epoch(record.get("ts"))
-        if not isinstance(period, dict) or percent is None or seen_at is None:
-            continue
-        end = iso_to_epoch(period.get("end"))
-        if end is None:
-            continue
-        name = grok_window_name(iso_to_epoch(period.get("start")), end)
-        entry["windows"][name] = merge_window(
-            entry["windows"].get(name), percent, end, seen_at, touch=True
-        )
-        entry["plan"] = context.get("subscriptionTier") or entry["plan"]
+        found = grok_window(context.get("config"), iso_to_epoch(record.get("ts")))
+        if found:
+            take_newer_grok(entry, found[0], found[1], context.get("subscriptionTier"))
     return entry
 
 
 def read_grok_limits(home, now):
     root = os.path.join(home, ".grok", "logs")
-    merged = {"plan": None, "windows": {}}
+    merged = {"plan": None, "plan_seen_at": 0, "windows": {}}
     test = lambda n: n.startswith("unified") and ".jsonl" in n
     for path in recent_files(root, test, now - SEVEN_DAYS):
         entry = cached_parse(path, parse_grok_log)
-        merged["plan"] = entry["plan"] or merged["plan"]
         for name, window in entry["windows"].items():
-            if window:
-                merged["windows"][name] = merge_window(
-                    merged["windows"].get(name),
-                    window["used_percent"],
-                    window["resets_at"],
-                    window["seen_at"],
-                    touch=True,
-                )
-    return merged
+            take_newer_grok(merged, name, window, None)
+        if entry["plan"] and entry["plan_seen_at"] >= merged["plan_seen_at"]:
+            merged["plan"], merged["plan_seen_at"] = entry["plan"], entry["plan_seen_at"]
+    # `ai-quota refresh` 查到的结果。
+    snapshot = load_json(state_file(home, "grok.json"))
+    found = grok_window(snapshot.get("config"), snapshot.get("fetched_at"))
+    if found:
+        take_newer_grok(merged, found[0], found[1], snapshot.get("plan"))
+    return {"plan": merged["plan"], "windows": merged["windows"]}
 
 
 def grok_label(plan):
@@ -537,6 +571,356 @@ def read_antigravity(home):
     except OSError:
         pass
     return {"plan": plan}
+
+
+# 一键刷新：让各家官方客户端用它们自己的只读方式重新查一次额度。
+# 都不开对话、不花额度、不碰凭据，查到的数字只存百分比和时间。
+REFRESH_TIMEOUT_SECONDS = 45
+# 网页上连点“刷新”时，同一家这么久之内不重复查。
+REFRESH_MIN_GAP_SECONDS = 30
+CLIENT_INFO = {"name": "ai-quota", "version": "1"}
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+CLAUDE_USAGE_LINES = (("five_hour", "current session"), ("seven_day", "current week (all models)"))
+
+
+class RefreshError(Exception):
+    """某一家刷新失败。消息会直接显示给用户，不能带凭据或账号。"""
+
+
+def find_binary(name):
+    import shutil
+
+    for path in (
+        shutil.which(name),
+        os.path.expanduser("~/.local/bin/" + name),
+        os.path.expanduser("~/.{0}/bin/{0}".format(name)),
+    ):
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    raise RefreshError("没找到 {} 命令".format(name))
+
+
+def refresh_workdir(home):
+    """客户端在这个目录里启动，不在用户的项目里留下任何东西。"""
+    path = os.path.dirname(state_path(home))
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def rpc_exchange(args, requests, cwd, timeout=REFRESH_TIMEOUT_SECONDS, jsonrpc=False):
+    """启动官方客户端的 stdio 协议进程，按顺序发请求，返回最后一个请求的 result。
+
+    requests 是 (method, params, 要不要等回复) 的列表。服务端发来的通知和请求都跳过。
+    """
+    import select
+    import subprocess
+
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=cwd,
+            bufsize=0,
+        )
+    except OSError:
+        raise RefreshError("启动失败")
+    deadline = time.monotonic() + timeout
+    buffer = b""
+
+    def next_message():
+        nonlocal buffer
+        while b"\n" not in buffer:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise RefreshError("超时")
+            ready, _, _ = select.select([proc.stdout], [], [], min(left, 1.0))
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RefreshError("客户端提前退出")
+                buffer += chunk
+        line, buffer = buffer.split(b"\n", 1)
+        try:
+            message = json.loads(line)
+        except ValueError:
+            return None
+        return message if isinstance(message, dict) else None
+
+    try:
+        result = None
+        for index, (method, params, wants_reply) in enumerate(requests, 1):
+            message = {"method": method}
+            if params is not None:
+                message["params"] = params
+            if jsonrpc:
+                message["jsonrpc"] = "2.0"
+            if wants_reply:
+                message["id"] = index
+            proc.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+            if not wants_reply:
+                continue
+            while True:
+                reply = next_message()
+                if reply and reply.get("id") == index and "method" not in reply:
+                    break
+            if "error" in reply or not isinstance(reply.get("result"), dict):
+                raise RefreshError("客户端拒绝了请求")
+            result = reply["result"]
+        return result
+    except OSError:
+        raise RefreshError("和客户端通信失败")
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+
+
+def parse_claude_reset(text, now):
+    """解析 `/usage` 里的“resets Nov 10 at 1:59am (America/Los_Angeles)”，返回时间戳。"""
+    import re
+    from datetime import datetime, timedelta
+
+    match = re.search(
+        r"resets\s+(?:(?:on\s+)?([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?"
+        r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)\s*(?:\(([^)]+)\))?",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    month, day, hour, minute, half, zone = match.groups()
+    hour = int(hour) % 12 + (12 if half.lower() == "pm" else 0)
+    minute = int(minute or 0)
+    tz = None
+    if zone:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tz = ZoneInfo(zone.strip())
+        except Exception:
+            tz = None
+    current = datetime.fromtimestamp(now, tz)
+    if month:
+        if month[:3].lower() not in MONTHS:
+            return None
+        number = MONTHS.index(month[:3].lower()) + 1
+        # 只写了月和日。取不早于昨天的那一年，跨年时就是明年。
+        for year in (current.year, current.year + 1):
+            try:
+                candidate = current.replace(
+                    year=year, month=number, day=int(day), hour=hour, minute=minute, second=0, microsecond=0
+                )
+            except ValueError:
+                return None
+            if candidate.timestamp() >= now - 86400:
+                return candidate.timestamp()
+        return None
+    candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate.timestamp() < now - 60:
+        candidate += timedelta(days=1)
+    return candidate.timestamp()
+
+
+def parse_claude_usage(text, now):
+    """从 `claude -p /usage` 的文字里取出 5 小时和每周两个窗口。"""
+    import re
+
+    found = {}
+    for line in str(text or "").splitlines():
+        lowered = line.strip().lower()
+        for key, label in CLAUDE_USAGE_LINES:
+            if not lowered.startswith(label):
+                continue
+            percent = re.search(r"(\d+(?:\.\d+)?)\s*%\s*used", line, re.IGNORECASE)
+            resets_at = parse_claude_reset(line, now)
+            if percent and resets_at:
+                found[key] = {"used_percent": float(percent.group(1)), "resets_at": int(resets_at), "seen_at": now}
+    return found
+
+
+def parse_codex_rate_limits(result, fetched_at):
+    """把 Codex app-server 的 account/rateLimits/read 结果换成和日志一样的结构。账号 ID 不留。"""
+    by_id = result.get("rateLimitsByLimitId") if isinstance(result, dict) else None
+    if not isinstance(by_id, dict) or not by_id:
+        single = result.get("rateLimits") if isinstance(result, dict) else None
+        by_id = {(single or {}).get("limitId") or "codex": single} if isinstance(single, dict) else {}
+    limits = {}
+    for limit_id, snapshot in by_id.items():
+        if not isinstance(snapshot, dict):
+            continue
+        windows = {}
+        for key in ("primary", "secondary"):
+            window = snapshot.get(key)
+            if not isinstance(window, dict):
+                continue
+            if not isinstance(window.get("usedPercent"), (int, float)) or not isinstance(window.get("resetsAt"), (int, float)):
+                continue
+            minutes = window.get("windowDurationMins")
+            name = WINDOW_NAMES.get(minutes, "{} 分钟".format(minutes))
+            windows[name] = {
+                "used_percent": float(window["usedPercent"]),
+                "resets_at": int(window["resetsAt"]),
+                "seen_at": fetched_at,
+            }
+        limits[limit_id or "codex"] = {"plan": snapshot.get("planType"), "windows": windows}
+    return limits
+
+
+def refresh_claude(home, now):
+    """`claude -p /usage`：Claude Code 自己的额度命令，不跑模型，也不保存会话。"""
+    import subprocess
+
+    binary = find_binary("claude")
+    try:
+        result = subprocess.run(
+            # 不连 MCP 服务器，启动快一秒多；/usage 用不到它们。
+            [binary, "-p", "/usage", "--no-session-persistence", "--strict-mcp-config", "--output-format", "json"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=REFRESH_TIMEOUT_SECONDS,
+            cwd=refresh_workdir(home),
+        )
+        data = json.loads(result.stdout)
+    except subprocess.TimeoutExpired:
+        raise RefreshError("超时")
+    except (OSError, ValueError):
+        raise RefreshError("查询失败")
+    found = parse_claude_usage(data.get("result") if isinstance(data, dict) else None, now)
+    if not found:
+        raise RefreshError("没读到额度，可能没用订阅登录")
+    state = load_claude_state(home)
+    state.update(found)
+    write_json_atomic(state_path(home), state)
+
+
+def refresh_codex(home, now):
+    """Codex app-server 的 account/rateLimits/read：编辑器插件查额度用的就是它。"""
+    result = rpc_exchange(
+        [find_binary("codex"), "app-server"],
+        [
+            ("initialize", {"clientInfo": CLIENT_INFO}, True),
+            ("initialized", None, False),
+            ("account/rateLimits/read", {"excludeResetCreditDetails": True}, True),
+        ],
+        cwd=refresh_workdir(home),
+    )
+    limits = parse_codex_rate_limits(result, now)
+    if not any(entry["windows"] for entry in limits.values()):
+        raise RefreshError("没读到额度，可能没用 ChatGPT 账号登录")
+    write_json_atomic(state_file(home, "codex.json"), {"fetched_at": now, "limits": limits})
+
+
+def refresh_grok(home, now):
+    """Grok Build 的 ACP 接口 `_x.ai/billing`：不建会话，只查额度。"""
+    result = rpc_exchange(
+        [find_binary("grok"), "agent", "--no-leader", "stdio"],
+        [
+            (
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
+                    "clientInfo": CLIENT_INFO,
+                },
+                True,
+            ),
+            ("_x.ai/billing", {}, True),
+        ],
+        cwd=refresh_workdir(home),
+        jsonrpc=True,
+    )
+    config = result.get("config")
+    if not grok_window(config, now):
+        raise RefreshError("没读到额度，可能没登录")
+    period = config.get("currentPeriod") or {}
+    write_json_atomic(
+        state_file(home, "grok.json"),
+        {
+            "fetched_at": now,
+            "plan": result.get("subscription_tier"),
+            "config": {
+                "creditUsagePercent": config.get("creditUsagePercent"),
+                "currentPeriod": {"start": period.get("start"), "end": period.get("end")},
+            },
+        },
+    )
+
+
+def refresh_antigravity(home, now):
+    """`agy -p /usage`，和平时一样，只是不等 5 分钟的间隔。"""
+    binary = agy_binary()
+    if not binary:
+        raise RefreshError("没找到 agy 命令")
+    read_antigravity_usage(home, now, max_age=0, runner=lambda: run_agy_usage(binary))
+    if load_json(state_file(home, "antigravity.json")).get("fetched_at") != now:
+        raise RefreshError("查询失败")
+
+
+REFRESHERS = (
+    ("claude", "Claude", refresh_claude),
+    ("codex", "Codex", refresh_codex),
+    ("grok", "Grok", refresh_grok),
+    ("antigravity", "Antigravity", refresh_antigravity),
+)
+_last_refresh = {}
+
+
+def refresh_all(home=None, now=None, min_gap=0, refreshers=None):
+    """四家并行查一次，返回每家的结果。一家失败不影响其他家。"""
+    import threading
+
+    home = home or home_dir()
+    now = now or time.time()
+    if refreshers is None:
+        refreshers = REFRESHERS
+        # 临时 home 是测试环境，不查真实账号。
+        if home != os.path.expanduser("~"):
+            return [
+                {"service": service, "name": name, "ok": False, "message": "测试环境，没有查询"}
+                for service, name, _ in refreshers
+            ]
+    results = {}
+
+    def run(service, name, refresher):
+        last = _last_refresh.get((home, service))
+        if min_gap and last and last["ok"] and 0 <= now - last["at"] < min_gap:
+            results[service] = {"service": service, "name": name, "ok": True, "message": "刚刷新过"}
+            return
+        try:
+            refresher(home, now)
+            outcome = {"service": service, "name": name, "ok": True, "message": "已更新"}
+        except RefreshError as error:
+            outcome = {"service": service, "name": name, "ok": False, "message": str(error)}
+        except Exception as error:
+            outcome = {"service": service, "name": name, "ok": False, "message": "出错了：{}".format(type(error).__name__)}
+        _last_refresh[(home, service)] = {"at": now, "ok": outcome["ok"]}
+        results[service] = outcome
+
+    threads = [threading.Thread(target=run, args=item, daemon=True) for item in refreshers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(REFRESH_TIMEOUT_SECONDS + 10)
+    return [
+        results.get(service) or {"service": service, "name": name, "ok": False, "message": "超时"}
+        for service, name, _ in refreshers
+    ]
+
+
+def render_refresh(results):
+    rows = [(item["name"], item["message"]) for item in results]
+    return "\n".join(["让官方客户端重新查了一次额度：", ""] + render_table(rows))
 
 
 def service_entry(service, name, plan, label, windows, note, unlimited=False, detail=None):
@@ -849,8 +1233,14 @@ class ReportStore:
         with self._lock:
             now = time.time()
             stale = self._report is None or now - self._report["generated_at"] > self.max_age
-            if fresh or stale:
-                self._report = collect(home=self.home, now=now, fresh=fresh)
+            if fresh:
+                # 网页上的“刷新”：先让各家客户端重新查，再读。
+                results = refresh_all(home=self.home, min_gap=REFRESH_MIN_GAP_SECONDS)
+                now = time.time()
+                self._report = collect(home=self.home, now=now, fresh=True)
+                self._report["refresh"] = results
+            elif stale:
+                self._report = collect(home=self.home, now=now, fresh=False)
             return self._report
 
 
@@ -1021,6 +1411,13 @@ def main(argv=None):
     if argv == ["--json"]:
         print(json.dumps(collect(fresh=True), ensure_ascii=False, indent=2))
         return 0
+    if argv == ["refresh"]:
+        results = refresh_all()
+        color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        print(render_refresh(results))
+        print()
+        print(render(collect(fresh=True), color=color))
+        return 0 if any(item["ok"] for item in results) else 1
     if not argv:
         color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
         print(render(collect(fresh=True), color=color))
